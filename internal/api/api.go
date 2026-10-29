@@ -3,7 +3,11 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
+	"time"
+
+	"github.com/sakethchoppara/cic/internal/runner"
 )
 
 const (
@@ -12,10 +16,15 @@ const (
 	// JSON escaping can inflate code/stdin up to 6x (\u00XX), so the body cap is generous;
 	// the per-field checks below are the real limits.
 	maxBody = 6 * (maxCode + maxStdin)
+
+	defaultTimeoutMS = 5000
+	maxTimeoutMS     = 15000
+	minMemoryMB      = 32
+	maxMemoryMB      = 512
 )
 
 // ponytail: hardcoded until config/languages.yaml lands in Week 3.
-var languages = map[string]bool{"python": true, "node": true, "c": true, "rust": true, "go": true}
+var languages = map[string]runner.Lang{"python": runner.Python}
 
 type ExecuteRequest struct {
 	Language string `json:"language"`
@@ -46,13 +55,14 @@ type ExecuteResponse struct {
 	Warm            bool    `json:"warm"`
 }
 
-func Routes() http.Handler {
+func Routes(run *runner.Runner) http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/execute", execute)
+	mux.HandleFunc("POST /v1/execute", func(w http.ResponseWriter, r *http.Request) { execute(w, r, run) })
 	return mux
 }
 
-func execute(w http.ResponseWriter, r *http.Request) {
+func execute(w http.ResponseWriter, r *http.Request, run *runner.Runner) {
+	start := time.Now()
 	var req ExecuteRequest
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBody))
 	dec.DisallowUnknownFields()
@@ -65,17 +75,46 @@ func execute(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
+	lang, ok := languages[req.Language]
+	if req.Limits.TimeoutMS == 0 {
+		req.Limits.TimeoutMS = defaultTimeoutMS
+	}
 	switch {
 	case len(req.Code) > maxCode || len(req.Stdin) > maxStdin:
 		httpError(w, http.StatusRequestEntityTooLarge, "code and stdin are limited to 64 KB each")
-	case !languages[req.Language]:
+		return
+	case !ok:
 		httpError(w, http.StatusBadRequest, "unknown language: "+req.Language)
+		return
 	case req.Code == "":
 		httpError(w, http.StatusBadRequest, "code is required")
-	default:
-		// Stub: Week 2 replaces this with the runner.
-		writeJSON(w, http.StatusOK, ExecuteResponse{Status: "ok"})
+		return
+	case req.Limits.TimeoutMS < 0 || req.Limits.TimeoutMS > maxTimeoutMS:
+		httpError(w, http.StatusBadRequest, "timeout_ms must be between 1 and 15000")
+		return
+	case req.Limits.MemoryMB != 0 && (req.Limits.MemoryMB < minMemoryMB || req.Limits.MemoryMB > maxMemoryMB):
+		httpError(w, http.StatusBadRequest, "memory_mb must be between 32 and 512")
+		return
 	}
+
+	// r.Context(): a client disconnect cancels the run and frees the container.
+	res, err := run.Run(r.Context(), lang, req.Code, req.Stdin,
+		time.Duration(req.Limits.TimeoutMS)*time.Millisecond, req.Limits.MemoryMB)
+	if err != nil {
+		log.Printf("execute %s: %v", req.Language, err)
+		writeJSON(w, http.StatusInternalServerError, ExecuteResponse{Status: "internal_error"})
+		return
+	}
+	writeJSON(w, http.StatusOK, ExecuteResponse{
+		Status:          res.Status,
+		Phase:           res.Phase,
+		Stdout:          res.Stdout,
+		Stderr:          res.Stderr,
+		ExitCode:        res.ExitCode,
+		StdoutTruncated: res.StdoutTruncated,
+		StderrTruncated: res.StderrTruncated,
+		Timings:         Timings{RunMS: res.RunMS, TotalMS: time.Since(start).Milliseconds()},
+	})
 }
 
 func httpError(w http.ResponseWriter, code int, msg string) {

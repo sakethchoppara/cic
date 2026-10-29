@@ -12,7 +12,8 @@ func TestExecute(t *testing.T) {
 		name, method, body string
 		want               int
 	}{
-		{"ok", "POST", `{"language":"python","code":"print(1)"}`, 200},
+		{"timeout too large", "POST", `{"language":"python","code":"x","limits":{"timeout_ms":15001}}`, 400},
+		{"memory too large", "POST", `{"language":"python","code":"x","limits":{"memory_mb":513}}`, 400},
 		{"unknown language", "POST", `{"language":"cobol","code":"x"}`, 400},
 		{"missing code", "POST", `{"language":"python"}`, 400},
 		{"bad json", "POST", `{`, 400},
@@ -21,7 +22,7 @@ func TestExecute(t *testing.T) {
 		{"body too large", "POST", `{"language":"python","code":"` + strings.Repeat("a", maxBody) + `"}`, 413},
 		{"wrong method", "GET", ``, 405},
 	}
-	h := Routes()
+	h := Routes(nil) // every case is rejected before the runner is touched; runner has its own tests
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			rec := httptest.NewRecorder()

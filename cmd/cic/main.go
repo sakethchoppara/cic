@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sakethchoppara/cic/internal/api"
+	"github.com/sakethchoppara/cic/internal/runner"
 )
 
 func main() {
@@ -21,7 +22,13 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	srv := &http.Server{Addr: *addr, Handler: api.Routes(), ReadHeaderTimeout: 5 * time.Second}
+	run, err := runner.New()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer run.Close()
+
+	srv := &http.Server{Addr: *addr, Handler: api.Routes(run), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
