@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"maps"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/sakethchoppara/cic/internal/runner"
@@ -22,9 +24,6 @@ const (
 	minMemoryMB      = 32
 	maxMemoryMB      = 512
 )
-
-// ponytail: hardcoded until config/languages.yaml lands in Week 3.
-var languages = map[string]runner.Lang{"python": runner.Python}
 
 type ExecuteRequest struct {
 	Language string `json:"language"`
@@ -55,13 +54,15 @@ type ExecuteResponse struct {
 	Warm            bool    `json:"warm"`
 }
 
-func Routes(run *runner.Runner) http.Handler {
+func Routes(run *runner.Runner, langs map[string]runner.Lang) http.Handler {
+	names := slices.Sorted(maps.Keys(langs))
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/execute", func(w http.ResponseWriter, r *http.Request) { execute(w, r, run) })
+	mux.HandleFunc("POST /v1/execute", func(w http.ResponseWriter, r *http.Request) { execute(w, r, run, langs) })
+	mux.HandleFunc("GET /v1/languages", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, http.StatusOK, names) })
 	return mux
 }
 
-func execute(w http.ResponseWriter, r *http.Request, run *runner.Runner) {
+func execute(w http.ResponseWriter, r *http.Request, run *runner.Runner, langs map[string]runner.Lang) {
 	start := time.Now()
 	var req ExecuteRequest
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBody))
@@ -75,7 +76,7 @@ func execute(w http.ResponseWriter, r *http.Request, run *runner.Runner) {
 		httpError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
-	lang, ok := languages[req.Language]
+	lang, ok := langs[req.Language]
 	if req.Limits.TimeoutMS == 0 {
 		req.Limits.TimeoutMS = defaultTimeoutMS
 	}
@@ -113,7 +114,7 @@ func execute(w http.ResponseWriter, r *http.Request, run *runner.Runner) {
 		ExitCode:        res.ExitCode,
 		StdoutTruncated: res.StdoutTruncated,
 		StderrTruncated: res.StderrTruncated,
-		Timings:         Timings{RunMS: res.RunMS, TotalMS: time.Since(start).Milliseconds()},
+		Timings:         Timings{CompileMS: res.CompileMS, RunMS: res.RunMS, TotalMS: time.Since(start).Milliseconds()},
 	})
 }
 

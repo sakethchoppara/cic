@@ -5,6 +5,7 @@ go 1.27.3
 require (
 	github.com/moby/moby/api v1.56.1
 	github.com/moby/moby/client v0.6.2
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (

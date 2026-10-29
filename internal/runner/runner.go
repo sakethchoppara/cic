@@ -14,40 +14,27 @@ import (
 	"github.com/moby/moby/api/pkg/stdcopy"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/client"
+
+	"github.com/sakethchoppara/cic/internal/config"
 )
 
 const (
-	streamCap = 64 << 10  // per-stream bytes kept (FR8)
-	floodCap  = 256 << 10 // combined bytes seen before the container is killed (FR8)
-	pidsLimit = 64
+	streamCap      = 64 << 10  // per-stream bytes kept (FR8)
+	floodCap       = 256 << 10 // combined bytes seen before the container is killed (FR8)
+	pidsLimit      = 64
+	compileTimeout = 10 * time.Second
 )
 
-// Lang describes how to run one language. ponytail: single hardcoded Python entry
-// until config/languages.yaml lands in Week 3.
-type Lang struct {
-	Image, User, SourceFile string
-	RunCmd                  []string
-	Env                     []string
-	RunMemoryMB, TmpfsMB    int
-}
-
-var Python = Lang{
-	Image:       "python:3.12-slim",
-	User:        "nobody",
-	SourceFile:  "main.py",
-	RunCmd:      []string{"python3", "main.py"},
-	Env:         []string{"HOME=/tmp", "PYTHONDONTWRITEBYTECODE=1"},
-	RunMemoryMB: 256,
-	TmpfsMB:     16,
-}
+type Lang = config.Lang
 
 type Result struct {
-	Status          string // ok, runtime_error, timeout, memory_exceeded
-	Phase           string
+	Status          string // ok, compile_error, runtime_error, timeout, memory_exceeded
+	Phase           string // compile or run; empty when ok
 	Stdout, Stderr  string
 	ExitCode        int
 	StdoutTruncated bool
 	StderrTruncated bool
+	CompileMS       int64
 	RunMS           int64
 }
 
@@ -63,13 +50,29 @@ func New() (*Runner, error) {
 
 func (r *Runner) Close() error { return r.cli.Close() }
 
+// Check starts a container for lang and removes it. It fails if the image is
+// missing or lacks lang.User (Docker refuses to start as an unknown user).
+func (r *Runner) Check(ctx context.Context, lang Lang) error {
+	id, err := r.start(ctx, lang, lang.RunMemoryMB, pidsLimit)
+	if id != "" {
+		r.cli.ContainerRemove(context.Background(), id, client.ContainerRemoveOptions{Force: true})
+	}
+	return err
+}
+
 // Run executes code under lang with the given run timeout and memory limit (memoryMB 0 = language default).
 // A non-nil error means the run could not be carried out (internal_error), not that the program failed.
 func (r *Runner) Run(ctx context.Context, lang Lang, code, stdin string, timeout time.Duration, memoryMB int) (Result, error) {
 	if memoryMB == 0 {
 		memoryMB = lang.RunMemoryMB
 	}
-	id, err := r.start(ctx, lang, memoryMB)
+	compiled := len(lang.CompileCmd) > 0
+	// One cgroup per container, so it starts at the compile budget and is lowered after compiling (FR4).
+	mem, pids := memoryMB, pidsLimit
+	if compiled {
+		mem, pids = lang.CompileMemoryMB, lang.CompilePids
+	}
+	id, err := r.start(ctx, lang, mem, pids)
 	if id != "" {
 		// Fresh context: the container must go even if ctx is done (FR2).
 		defer r.cli.ContainerRemove(context.Background(), id, client.ContainerRemoveOptions{Force: true})
@@ -84,24 +87,62 @@ func (r *Runner) Run(ctx context.Context, lang Lang, code, stdin string, timeout
 		return Result{}, fmt.Errorf("write source: %v %s", err, src.stderr.buf.String())
 	}
 
-	runCtx, cancel := context.WithTimeout(ctx, timeout)
+	var compileMS int64
+	ooms := 0
+	if compiled {
+		res, err := r.phase(ctx, id, lang, "compile", lang.CompileCmd, "", compileTimeout, &ooms)
+		if err != nil || res.Status != "ok" {
+			if res.Status == "runtime_error" {
+				res.Status = "compile_error"
+			}
+			return res, err
+		}
+		compileMS = res.CompileMS
+
+		// Build caches in /tmp are tmpfs pages charged to this cgroup; drop them before
+		// shrinking the limit so the run budget is the program's alone.
+		if c, err := r.exec(ctx, id, lang, []string{"find", "/tmp", "-mindepth", "1", "-delete"}, ""); err != nil || c.exitCode != 0 {
+			return Result{}, fmt.Errorf("clear /tmp: %v %s", err, c.stderr.buf.String())
+		}
+		m, p := int64(memoryMB)<<20, int64(pidsLimit)
+		if _, err := r.cli.ContainerUpdate(ctx, id, client.ContainerUpdateOptions{
+			Resources: &container.Resources{Memory: m, MemorySwap: m, PidsLimit: &p},
+		}); err != nil {
+			return Result{}, fmt.Errorf("lower limits: %w", err)
+		}
+	}
+
+	res, err := r.phase(ctx, id, lang, "run", lang.RunCmd, stdin, timeout, &ooms)
+	res.CompileMS = compileMS
+	return res, err
+}
+
+// phase runs one exec under timeout and classifies it. ooms is the cgroup's
+// oom_kill count before the phase and is updated to the count after it.
+// Timing goes in RunMS or CompileMS by phase name.
+func (r *Runner) phase(ctx context.Context, id string, lang Lang, name string, cmd []string, stdin string, timeout time.Duration, ooms *int) (Result, error) {
+	pctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	start := time.Now()
-	run, err := r.exec(runCtx, id, lang, lang.RunCmd, stdin)
+	ex, err := r.exec(pctx, id, lang, cmd, stdin)
 	res := Result{
-		Phase:           "run",
-		Stdout:          run.stdout.buf.String(),
-		Stderr:          run.stderr.buf.String(),
-		ExitCode:        run.exitCode,
-		StdoutTruncated: run.stdout.truncated,
-		StderrTruncated: run.stderr.truncated,
-		RunMS:           time.Since(start).Milliseconds(),
+		Phase:           name,
+		Stdout:          ex.stdout.buf.String(),
+		Stderr:          ex.stderr.buf.String(),
+		ExitCode:        ex.exitCode,
+		StdoutTruncated: ex.stdout.truncated,
+		StderrTruncated: ex.stderr.truncated,
+	}
+	if ms := time.Since(start).Milliseconds(); name == "compile" {
+		res.CompileMS = ms
+	} else {
+		res.RunMS = ms
 	}
 	switch {
 	case errors.Is(err, errFlood):
 		res.Status, res.StdoutTruncated = "runtime_error", true
 		return res, nil
-	case runCtx.Err() != nil && ctx.Err() == nil:
+	case pctx.Err() != nil && ctx.Err() == nil:
 		res.Status = "timeout"
 		return res, nil
 	case err != nil:
@@ -110,24 +151,27 @@ func (r *Runner) Run(ctx context.Context, lang Lang, code, stdin string, timeout
 
 	// FR7.5: an exec'd process can be OOM-killed while `sleep infinity` lives on,
 	// so State.OOMKilled never fires. The cgroup's own counter does.
-	if ooms, err := r.oomKills(ctx, id, lang); err != nil {
+	n, err := r.oomKills(ctx, id, lang)
+	if err != nil {
 		return res, err
-	} else if ooms > 0 {
-		res.Status = "memory_exceeded"
-		return res, nil
 	}
-	if res.ExitCode != 0 {
+	before := *ooms
+	*ooms = n
+	switch {
+	case n > before:
+		res.Status = "memory_exceeded"
+	case res.ExitCode != 0:
 		res.Status = "runtime_error"
-	} else {
+	default:
 		res.Status, res.Phase = "ok", ""
 	}
 	return res, nil
 }
 
 // start creates and starts an idle container with every FR3-FR5 control applied.
-func (r *Runner) start(ctx context.Context, lang Lang, memoryMB int) (string, error) {
+func (r *Runner) start(ctx context.Context, lang Lang, memoryMB, pidsMax int) (string, error) {
 	mem := int64(memoryMB) << 20
-	pids := int64(pidsLimit)
+	pids := int64(pidsMax)
 	tmpfs := fmt.Sprintf("rw,nosuid,nodev,size=%dm,mode=1777", lang.TmpfsMB)
 	created, err := r.cli.ContainerCreate(ctx, client.ContainerCreateOptions{
 		Config: &container.Config{

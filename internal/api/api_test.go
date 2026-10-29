@@ -4,6 +4,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/sakethchoppara/cic/internal/runner"
 )
 
 func TestExecute(t *testing.T) {
@@ -22,7 +24,7 @@ func TestExecute(t *testing.T) {
 		{"body too large", "POST", `{"language":"python","code":"` + strings.Repeat("a", maxBody) + `"}`, 413},
 		{"wrong method", "GET", ``, 405},
 	}
-	h := Routes(nil) // every case is rejected before the runner is touched; runner has its own tests
+	h := Routes(nil, map[string]runner.Lang{"python": {}}) // every case is rejected before the runner is touched; runner has its own tests
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			rec := httptest.NewRecorder()
