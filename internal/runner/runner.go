@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -36,16 +37,22 @@ type Result struct {
 	StderrTruncated bool
 	CompileMS       int64
 	RunMS           int64
+	QueueMS         int64 // set by pool
+	Warm            bool  // set by pool
 }
 
-type Runner struct{ cli *client.Client }
+type Runner struct {
+	cli *client.Client
+	id  string // value of the "cic" label on this Runner's containers
+}
 
 func New() (*Runner, error) {
 	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return nil, err
 	}
-	return &Runner{cli: cli}, nil
+	id := strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	return &Runner{cli: cli, id: id}, nil
 }
 
 func (r *Runner) Close() error { return r.cli.Close() }
@@ -53,33 +60,79 @@ func (r *Runner) Close() error { return r.cli.Close() }
 // Check starts a container for lang and removes it. It fails if the image is
 // missing or lacks lang.User (Docker refuses to start as an unknown user).
 func (r *Runner) Check(ctx context.Context, lang Lang) error {
-	id, err := r.start(ctx, lang, lang.RunMemoryMB, pidsLimit)
-	if id != "" {
-		r.cli.ContainerRemove(context.Background(), id, client.ContainerRemoveOptions{Force: true})
+	id, err := r.Start(ctx, lang)
+	if err == nil {
+		r.Remove(id)
 	}
 	return err
 }
 
-// Run executes code under lang with the given run timeout and memory limit (memoryMB 0 = language default).
-// A non-nil error means the run could not be carried out (internal_error), not that the program failed.
+// Run is a cold run: Start, Exec, Remove.
 func (r *Runner) Run(ctx context.Context, lang Lang, code, stdin string, timeout time.Duration, memoryMB int) (Result, error) {
+	id, err := r.Start(ctx, lang)
+	if err != nil {
+		return Result{}, err
+	}
+	defer r.Remove(id)
+	return r.Exec(ctx, id, lang, code, stdin, timeout, memoryMB)
+}
+
+// Start creates and starts an idle container for lang (FR6). One cgroup per container,
+// so compiled languages start at the compile budget and Exec lowers it after compiling (FR4).
+func (r *Runner) Start(ctx context.Context, lang Lang) (string, error) {
+	mem, pids := lang.RunMemoryMB, pidsLimit
+	if len(lang.CompileCmd) > 0 {
+		mem, pids = lang.CompileMemoryMB, lang.CompilePids
+	}
+	id, err := r.start(ctx, lang, mem, pids)
+	if err != nil && id != "" {
+		r.Remove(id)
+	}
+	return id, err
+}
+
+// Remove force-removes a container. It uses a fresh context: the container
+// must go even if the request's context is done (FR2).
+func (r *Runner) Remove(id string) {
+	r.cli.ContainerRemove(context.Background(), id, client.ContainerRemoveOptions{Force: true})
+}
+
+// RemoveAll removes every cic container from any Runner, e.g. pool leftovers
+// from a crashed previous run (FR9).
+func (r *Runner) RemoveAll(ctx context.Context) (int, error) {
+	ids, err := r.list(ctx, "cic")
+	for _, id := range ids {
+		r.Remove(id)
+	}
+	return len(ids), err
+}
+
+// Containers counts this Runner's containers, for leak checks.
+func (r *Runner) Containers(ctx context.Context) (int, error) {
+	ids, err := r.list(ctx, "cic="+r.id)
+	return len(ids), err
+}
+
+func (r *Runner) list(ctx context.Context, label string) ([]string, error) {
+	list, err := r.cli.ContainerList(ctx, client.ContainerListOptions{All: true, Filters: client.Filters{}.Add("label", label)})
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, len(list.Items))
+	for i, c := range list.Items {
+		ids[i] = c.ID
+	}
+	return ids, nil
+}
+
+// Exec runs code in a container from Start, which must not be reused afterwards.
+// memoryMB 0 means the language default. A non-nil error means the run could not
+// be carried out (internal_error), not that the program failed.
+func (r *Runner) Exec(ctx context.Context, id string, lang Lang, code, stdin string, timeout time.Duration, memoryMB int) (Result, error) {
 	if memoryMB == 0 {
 		memoryMB = lang.RunMemoryMB
 	}
 	compiled := len(lang.CompileCmd) > 0
-	// One cgroup per container, so it starts at the compile budget and is lowered after compiling (FR4).
-	mem, pids := memoryMB, pidsLimit
-	if compiled {
-		mem, pids = lang.CompileMemoryMB, lang.CompilePids
-	}
-	id, err := r.start(ctx, lang, mem, pids)
-	if id != "" {
-		// Fresh context: the container must go even if ctx is done (FR2).
-		defer r.cli.ContainerRemove(context.Background(), id, client.ContainerRemoveOptions{Force: true})
-	}
-	if err != nil {
-		return Result{}, err
-	}
 
 	// FR7.2: stream source over exec stdin; the archive API can't write into tmpfs.
 	src, err := r.exec(ctx, id, lang, []string{"sh", "-c", "cat > /work/" + lang.SourceFile}, code)
@@ -104,11 +157,14 @@ func (r *Runner) Run(ctx context.Context, lang Lang, code, stdin string, timeout
 		if c, err := r.exec(ctx, id, lang, []string{"find", "/tmp", "-mindepth", "1", "-delete"}, ""); err != nil || c.exitCode != 0 {
 			return Result{}, fmt.Errorf("clear /tmp: %v %s", err, c.stderr.buf.String())
 		}
+	}
+	// The container was started with Start's budget; set the run budget if it differs.
+	if compiled || memoryMB != lang.RunMemoryMB {
 		m, p := int64(memoryMB)<<20, int64(pidsLimit)
 		if _, err := r.cli.ContainerUpdate(ctx, id, client.ContainerUpdateOptions{
 			Resources: &container.Resources{Memory: m, MemorySwap: m, PidsLimit: &p},
 		}); err != nil {
-			return Result{}, fmt.Errorf("lower limits: %w", err)
+			return Result{}, fmt.Errorf("set run limits: %w", err)
 		}
 	}
 
@@ -180,7 +236,7 @@ func (r *Runner) start(ctx context.Context, lang Lang, memoryMB, pidsMax int) (s
 			User:       lang.User,
 			Env:        lang.Env,
 			WorkingDir: "/work",
-			Labels:     map[string]string{"cic": "1"},
+			Labels:     map[string]string{"cic": r.id},
 		},
 		HostConfig: &container.HostConfig{
 			NetworkMode:    "none",

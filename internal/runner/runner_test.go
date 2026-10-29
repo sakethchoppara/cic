@@ -6,8 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/moby/moby/client"
-
 	"github.com/sakethchoppara/cic/internal/config"
 )
 
@@ -86,15 +84,9 @@ func TestNoLeakedContainers(t *testing.T) {
 	if _, err := r.Run(context.Background(), lang(t, r, langs, "python"), "print(1)", "", 5*time.Second, 0); err != nil {
 		t.Fatal(err)
 	}
-	list, err := r.cli.ContainerList(context.Background(), client.ContainerListOptions{
-		All: true, Filters: client.Filters{}.Add("label", "cic"),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	// Parallel subtests in earlier tests have finished by now (subtests block their parent).
-	if len(list.Items) != 0 {
-		t.Fatalf("%d cic containers left behind", len(list.Items))
+	if n, err := r.Containers(context.Background()); err != nil || n != 0 {
+		t.Fatalf("%d containers left behind (err %v)", n, err)
 	}
 }
 

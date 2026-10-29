@@ -9,7 +9,7 @@ import (
 	"slices"
 	"time"
 
-	"github.com/sakethchoppara/cic/internal/runner"
+	"github.com/sakethchoppara/cic/internal/pool"
 )
 
 const (
@@ -54,15 +54,22 @@ type ExecuteResponse struct {
 	Warm            bool    `json:"warm"`
 }
 
-func Routes(run *runner.Runner, langs map[string]runner.Lang) http.Handler {
-	names := slices.Sorted(maps.Keys(langs))
+func Routes(pools map[string]*pool.Pool) http.Handler {
+	names := slices.Sorted(maps.Keys(pools))
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/execute", func(w http.ResponseWriter, r *http.Request) { execute(w, r, run, langs) })
+	mux.HandleFunc("POST /v1/execute", func(w http.ResponseWriter, r *http.Request) { execute(w, r, pools) })
 	mux.HandleFunc("GET /v1/languages", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, http.StatusOK, names) })
+	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, r *http.Request) {
+		stats := make(map[string]pool.Stats, len(pools))
+		for name, p := range pools {
+			stats[name] = p.Stats()
+		}
+		writeJSON(w, http.StatusOK, stats)
+	})
 	return mux
 }
 
-func execute(w http.ResponseWriter, r *http.Request, run *runner.Runner, langs map[string]runner.Lang) {
+func execute(w http.ResponseWriter, r *http.Request, pools map[string]*pool.Pool) {
 	start := time.Now()
 	var req ExecuteRequest
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBody))
@@ -76,7 +83,7 @@ func execute(w http.ResponseWriter, r *http.Request, run *runner.Runner, langs m
 		httpError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
-	lang, ok := langs[req.Language]
+	p, ok := pools[req.Language]
 	if req.Limits.TimeoutMS == 0 {
 		req.Limits.TimeoutMS = defaultTimeoutMS
 	}
@@ -99,8 +106,11 @@ func execute(w http.ResponseWriter, r *http.Request, run *runner.Runner, langs m
 	}
 
 	// r.Context(): a client disconnect cancels the run and frees the container.
-	res, err := run.Run(r.Context(), lang, req.Code, req.Stdin,
+	res, err := p.Execute(r.Context(), req.Code, req.Stdin,
 		time.Duration(req.Limits.TimeoutMS)*time.Millisecond, req.Limits.MemoryMB)
+	if r.Context().Err() != nil {
+		return // client went away; nobody to answer
+	}
 	if err != nil {
 		log.Printf("execute %s: %v", req.Language, err)
 		writeJSON(w, http.StatusInternalServerError, ExecuteResponse{Status: "internal_error"})
@@ -114,7 +124,8 @@ func execute(w http.ResponseWriter, r *http.Request, run *runner.Runner, langs m
 		ExitCode:        res.ExitCode,
 		StdoutTruncated: res.StdoutTruncated,
 		StderrTruncated: res.StderrTruncated,
-		Timings:         Timings{CompileMS: res.CompileMS, RunMS: res.RunMS, TotalMS: time.Since(start).Milliseconds()},
+		Timings:         Timings{QueueMS: res.QueueMS, CompileMS: res.CompileMS, RunMS: res.RunMS, TotalMS: time.Since(start).Milliseconds()},
+		Warm:            res.Warm,
 	})
 }
 
