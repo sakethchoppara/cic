@@ -92,7 +92,7 @@ tests/security/     hostile programs run through the full stack
 bench/              latency benchmark and load test
 ```
 
-Design notes and the original plan are in [docs/PRD.md](docs/PRD.md).
+The reasoning behind each design choice is in [docs/decisions/](docs/decisions/), the original plan is in [docs/PRD.md](docs/PRD.md), and [docs/writeups/go-cache-time-bomb.md](docs/writeups/go-cache-time-bomb.md) tells the story of the strangest bug: Go builds that broke themselves 24 hours after the image was built.
 
 ## Tests
 
