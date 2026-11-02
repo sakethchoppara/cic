@@ -22,7 +22,14 @@ curl -s localhost:8088/v1/execute -d '{"language": "python", "code": "print(sum(
  "timings":{"queue_ms":0,"compile_ms":0,"run_ms":52,"total_ms":131},"warm":true}
 ```
 
-Or open http://127.0.0.1:8088 for a minimal test page: pick a language, edit the code and stdin, and see the status, output, and timings.
+Or with Docker Compose, which runs CIC behind a filtering Docker socket proxy so the service itself never holds the real socket (no Go needed after `images.sh`):
+
+```sh
+./scripts/images.sh
+docker compose up -d       # also on 127.0.0.1:8088; `docker compose down` removes every sandbox
+```
+
+Either way, open http://127.0.0.1:8088 for a minimal test page: pick a language, edit the code and stdin, and see the status, output, and timings.
 
 The API has no authentication. Keep it on localhost (see [SECURITY.md](SECURITY.md#known-gaps)).
 
@@ -92,6 +99,7 @@ internal/api/       HTTP handlers and validation
 internal/config/    languages.yaml loading
 internal/pool/      warm pool: buffered channel of idle containers + refill goroutine per language
 internal/runner/    Docker SDK: create, exec, limits, output capture, OOM detection
+internal/dockerproxy/  filtering Docker socket proxy (cmd/cic-dockerproxy), used by compose.yaml
 images/             cic-go image (Go with a pre-built, read-only standard library cache)
 tests/security/     hostile programs run through the full stack
 bench/              latency benchmark and load test

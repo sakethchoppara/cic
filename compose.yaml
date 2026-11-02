@@ -1,0 +1,37 @@
+# Run ./scripts/images.sh first: the language images (and cic-go) must exist on the host.
+#
+# Only dockerproxy gets the host's Docker socket, and it has no network.
+# cic gets only the proxy's socket, which allows the calls the runner needs on
+# sandboxed, cic-labelled containers and nothing else (see internal/dockerproxy).
+services:
+  dockerproxy:
+    build: .
+    command: ["/cic-dockerproxy", "-listen", "/run/cic/docker.sock", "-mode", "0666", "-config", "/config/languages.yaml"]
+    user: "0:0" # to open the host's Docker socket; holding it is root-equivalent anyway
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - cic-socket:/run/cic
+    restart: unless-stopped
+
+  cic:
+    build: .
+    command: ["/cic", "-addr", "0.0.0.0:8088", "-config", "/config/languages.yaml"]
+    environment:
+      DOCKER_HOST: unix:///run/cic/docker.sock
+    ports:
+      - "127.0.0.1:8088:8088" # no auth: localhost only
+    volumes:
+      - cic-socket:/run/cic
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on: [dockerproxy]
+    restart: on-failure # retries if it starts before the proxy socket exists
+    stop_grace_period: 30s # finish in-flight runs and remove pooled containers
+
+volumes:
+  cic-socket:
