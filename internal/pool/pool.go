@@ -23,8 +23,9 @@ type Pool struct {
 	idle   chan string   // started, unused container IDs
 	refill chan struct{} // one token per container owed to idle
 
-	cancel context.CancelFunc
-	done   sync.WaitGroup
+	cancel   context.CancelFunc
+	done     sync.WaitGroup // refillLoop
+	removing sync.WaitGroup // background removals of used containers
 
 	busy, waiting atomic.Int64
 }
@@ -110,7 +111,9 @@ func (p *Pool) Execute(ctx context.Context, code, stdin string, timeout time.Dur
 			return runner.Result{}, err
 		}
 	}
-	defer p.r.Remove(id) // destroy after use (FR2), warm or cold
+	// Destroy after use (FR2), warm or cold. Removal takes ~40ms, so it runs in the
+	// background instead of delaying the response; Close waits for it.
+	defer p.removing.Go(func() { p.r.Remove(id) })
 	res, err := p.r.Exec(ctx, id, p.lang, code, stdin, timeout, memoryMB)
 	res.QueueMS, res.Warm = queueMS, warm
 	return res, err
@@ -126,17 +129,19 @@ func (p *Pool) Stats() Stats {
 	return Stats{Idle: len(p.idle), Busy: p.busy.Load(), Waiting: p.waiting.Load()}
 }
 
-// Close stops refilling and removes idle containers. Call it after in-flight
-// Executes have returned (http.Server.Shutdown waits for them).
+// Close stops refilling, removes idle containers, and waits for used ones to be
+// removed. Call it after in-flight Executes have returned (http.Server.Shutdown
+// waits for them).
 func (p *Pool) Close() {
 	p.cancel()
 	p.done.Wait() // refillLoop has exited, so nothing pushes onto idle any more
-	for {
+	for drained := false; !drained; {
 		select {
 		case id := <-p.idle:
 			p.r.Remove(id)
 		default:
-			return
+			drained = true
 		}
 	}
+	p.removing.Wait()
 }
