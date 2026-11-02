@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -21,6 +22,7 @@ func main() {
 	cfgPath := flag.String("config", "config/languages.yaml", "language definitions")
 	poolSize := flag.Int("pool-size", 2, "idle containers kept per language")
 	queueTimeout := flag.Duration("queue-timeout", time.Second, "wait for a warm container before cold-starting one")
+	maxRuns := flag.Int("max-runs", runtime.NumCPU(), "executions allowed at once across all languages; others wait up to 10s, then get 503")
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -58,7 +60,7 @@ func main() {
 		pools[name] = pool.New(run, name, lang, *poolSize, *queueTimeout)
 	}
 
-	srv := &http.Server{Addr: *addr, Handler: api.Routes(pools), ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Addr: *addr, Handler: api.Routes(pools, *maxRuns), ReadHeaderTimeout: 5 * time.Second}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.ListenAndServe() }()
 	log.Printf("cic listening on %s", *addr)

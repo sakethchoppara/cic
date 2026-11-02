@@ -64,7 +64,7 @@ func TestHostilePrograms(t *testing.T) {
 		}
 		pools[name] = pool.New(r, name, lang, 2, 5*time.Second)
 	}
-	srv := httptest.NewServer(api.Routes(pools))
+	srv := httptest.NewServer(api.Routes(pools, 64))
 
 	t.Run("fixtures", func(t *testing.T) {
 		for _, c := range cases {

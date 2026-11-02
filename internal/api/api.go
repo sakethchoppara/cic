@@ -26,6 +26,9 @@ const (
 	maxMemoryMB      = 512
 )
 
+// How long a request waits for a run slot before getting 503. A var for tests.
+var slotWait = 10 * time.Second
+
 //go:embed index.html
 var indexHTML []byte
 
@@ -58,8 +61,12 @@ type ExecuteResponse struct {
 	Warm            bool    `json:"warm"`
 }
 
-func Routes(pools map[string]*pool.Pool) http.Handler {
+// Routes serves the API. At most maxRuns executions run at once across all
+// languages; each holds a container with up to 1 vCPU and 512 MB (1 GB while
+// compiling), so this cap is what bounds host load under a flood.
+func Routes(pools map[string]*pool.Pool, maxRuns int) http.Handler {
 	names := slices.Sorted(maps.Keys(pools))
+	slots := make(chan struct{}, maxRuns)
 	mux := http.NewServeMux()
 	// Exact root only, so a wrong method on an API path is still a 405, not a 404.
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
@@ -67,7 +74,7 @@ func Routes(pools map[string]*pool.Pool) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Write(indexHTML)
 	})
-	mux.HandleFunc("POST /v1/execute", func(w http.ResponseWriter, r *http.Request) { execute(w, r, pools) })
+	mux.HandleFunc("POST /v1/execute", func(w http.ResponseWriter, r *http.Request) { execute(w, r, pools, slots) })
 	mux.HandleFunc("GET /v1/languages", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, http.StatusOK, names) })
 	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, r *http.Request) {
 		stats := make(map[string]pool.Stats, len(pools))
@@ -79,7 +86,7 @@ func Routes(pools map[string]*pool.Pool) http.Handler {
 	return mux
 }
 
-func execute(w http.ResponseWriter, r *http.Request, pools map[string]*pool.Pool) {
+func execute(w http.ResponseWriter, r *http.Request, pools map[string]*pool.Pool, slots chan struct{}) {
 	start := time.Now()
 	var req ExecuteRequest
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBody))
@@ -112,6 +119,20 @@ func execute(w http.ResponseWriter, r *http.Request, pools map[string]*pool.Pool
 		return
 	case req.Limits.MemoryMB != 0 && (req.Limits.MemoryMB < minMemoryMB || req.Limits.MemoryMB > maxMemoryMB):
 		httpError(w, http.StatusBadRequest, "memory_mb must be between 32 and 512")
+		return
+	}
+
+	t := time.NewTimer(slotWait)
+	select {
+	case slots <- struct{}{}:
+		t.Stop()
+		defer func() { <-slots }()
+	case <-t.C:
+		w.Header().Set("Retry-After", "1")
+		httpError(w, http.StatusServiceUnavailable, "server busy, try again")
+		return
+	case <-r.Context().Done():
+		t.Stop()
 		return
 	}
 

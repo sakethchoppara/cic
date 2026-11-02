@@ -49,6 +49,8 @@ The response has `status`, `phase` (`compile` or `run`, when the status isn't `o
 | `memory_exceeded` | killed by the memory limit, during `compile` or `run` |
 | `internal_error` | CIC itself failed (HTTP 500) |
 
+When all `-max-runs` slots stay busy for 10 s, the request gets HTTP 503 with `Retry-After` instead.
+
 Each of `stdout` and `stderr` keeps the first 64 KB. Bad requests get HTTP 400, and oversized ones get 413.
 
 ### `GET /v1/languages`
@@ -71,6 +73,7 @@ Per language: idle containers in the pool, runs in progress, and requests waitin
 | `-config` | `config/languages.yaml` | language definitions |
 | `-pool-size` | `2` | idle containers kept per language |
 | `-queue-timeout` | `1s` | how long a request waits for a warm container before cold-starting one |
+| `-max-runs` | CPU count | executions at once across all languages; extra requests wait up to 10 s, then get 503 |
 
 Languages live in [`config/languages.yaml`](config/languages.yaml): image, user, compile and run commands, environment, and memory, process, and tmpfs budgets. Adding a language needs no code changes. A language whose image is missing, or lacks its user, is disabled at startup.
 

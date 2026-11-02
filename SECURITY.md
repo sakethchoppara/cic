@@ -31,6 +31,7 @@ Every run gets a fresh container that is destroyed afterwards, warm or cold. The
 | Disk exhaustion | tmpfs `size=` per language (16 to 128 MB), counted against memory |
 | Output floods | Each stream is capped at 64 KB in memory; past 256 KB combined, the container is killed |
 | Request size | Code and stdin at most 64 KB each; JSON body capped; unknown fields rejected |
+| Request floods | At most `-max-runs` executions at once across all languages (default: CPU count); others wait up to 10 s, then get HTTP 503 with `Retry-After` |
 | Cross-run leakage | Containers are never reused; idle pooled containers never contain user code; the Go build cache is read-only, so code can't poison it for later runs |
 | Leaked containers | Removed after every run with a fresh context (even on timeout or client disconnect); leftover `cic`-labelled containers removed at startup; pools drained on shutdown |
 | Exposure | Binds to `127.0.0.1:8088` by default |
@@ -75,7 +76,7 @@ Operating it more safely, in order of effort:
 These are real, unmitigated in v1, and roughly in order of severity.
 
 1. **Shared kernel.** Containers share the host kernel. A kernel exploit reachable through the syscalls the default seccomp profile allows escapes everything above. gVisor (`runsc`) or Firecracker microVMs would close this; gVisor is a drop-in Docker runtime.
-2. **No authentication, rate limiting, or concurrency cap.** Anyone who can reach the port can run code. When the warm pool is empty, every request cold-starts its own container, so N concurrent requests means N containers, each allowed up to 512 MB (1 GB while compiling) and 1 vCPU for up to 15 s. A modest flood exhausts host memory or CPU. Keep the default `127.0.0.1` bind until a global semaphore and authentication exist.
+2. **No authentication or per-client rate limiting.** Anyone who can reach the port can run code. The `-max-runs` cap bounds how many containers run at once, but not who uses them: one client can hold every slot and starve everyone else (they get 503). Size the cap to memory too: each run may use up to 512 MB, or 1 GB while compiling, so 16 slots can still reach 16 GB in the worst case. Keep the default `127.0.0.1` bind.
 3. **The Docker socket is root.** See above. A bug in the runner that lets request data reach container create options would be a host compromise.
 4. **No user namespace remapping.** UID 65534 in the container is UID 65534 on the host. Combined with gap 1, an escape lands as host `nobody` rather than an unmapped UID. Docker's `userns-remap` would add that layer.
 5. **Information disclosure.** `/proc` and `/sys` reveal the host kernel version, CPU model, memory size, and uptime. Timing and cache side channels between concurrent runs are not addressed.

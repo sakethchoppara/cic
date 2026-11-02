@@ -10,3 +10,5 @@
 - **The queue timeout limits how long a waiting request can be held up by a slow refill.** 1 s is long enough to catch a refill (about 150 ms) under light load, and short enough that under heavy load a request isn't stuck for long before going cold.
 
 **Consequences:** Pool size is a capacity knob only up to the refill rate. Past that, adding idle containers just delays when the pool drains. Real capacity under load needs parallel refills, plus a cap on concurrent cold starts. The cap also closes the main denial-of-service gap in `SECURITY.md`.
+
+**Update (Week 8):** `-max-runs` (default: CPU count) now caps executions across all languages. In a 60 s rerun with 50 clients and 16 slots, warm runs rose from 20% to 86%, throughput from 10.7 to 12.2 requests/s, and p99 latency fell from 9.0 s to 6.0 s. Fewer simultaneous creates keep the daemon from thrashing, so refills keep up. The p50 of 4.3 s is now mostly queueing for a slot, which is the intended behaviour under overload.

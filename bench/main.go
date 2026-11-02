@@ -51,6 +51,7 @@ func main() {
 	mode := flag.String("mode", "latency", "latency or load")
 	runs := flag.Int("n", 100, "latency: runs per language, program and mode")
 	workers := flag.Int("workers", 50, "load: concurrent clients")
+	maxRuns := flag.Int("max-runs", runtime.NumCPU(), "load: executions allowed at once (the server's -max-runs)")
 	duration := flag.Duration("duration", 5*time.Minute, "load: how long to run")
 	cfgPath := flag.String("config", "config/languages.yaml", "language definitions")
 	flag.Parse()
@@ -74,7 +75,7 @@ func main() {
 	case "latency":
 		latency(r, langs, *runs)
 	case "load":
-		if !load(r, langs, *workers, *duration) {
+		if !load(r, langs, *workers, *maxRuns, *duration) {
 			os.Exit(1)
 		}
 	default:
@@ -143,7 +144,7 @@ func pct(ds []time.Duration, p int) int64 {
 // load runs workers concurrent clients against the HTTP API for d, with a mix
 // of normal and hostile programs, then checks for internal errors, leaked
 // containers and goroutine growth. It reports whether all checks passed.
-func load(r *runner.Runner, langs map[string]runner.Lang, workers int, d time.Duration) bool {
+func load(r *runner.Runner, langs map[string]runner.Lang, workers, maxRuns int, d time.Duration) bool {
 	type job struct {
 		lang, code string
 		memoryMB   int
@@ -171,7 +172,7 @@ func load(r *runner.Runner, langs map[string]runner.Lang, workers int, d time.Du
 	for _, name := range langOrder {
 		pools[name] = pool.New(r, name, langs[name], 2, time.Second)
 	}
-	srv := httptest.NewServer(api.Routes(pools))
+	srv := httptest.NewServer(api.Routes(pools, maxRuns))
 	client := &http.Client{Transport: &http.Transport{MaxIdleConnsPerHost: workers}}
 
 	waitFull := func() {
@@ -184,9 +185,9 @@ func load(r *runner.Runner, langs map[string]runner.Lang, workers int, d time.Du
 	waitFull()
 	before := runtime.NumGoroutine()
 	containersBefore, _ := r.Containers(context.Background())
-	log.Printf("load: %d workers for %v; %d goroutines, %d containers (idle pools)", workers, d, before, containersBefore)
+	log.Printf("load: %d workers, %d run slots, for %v; %d goroutines, %d containers (idle pools)", workers, maxRuns, d, before, containersBefore)
 
-	var total, wrong, internal, warm atomic.Int64
+	var total, wrong, internal, warm, busy atomic.Int64
 	var mu sync.Mutex
 	statuses := map[string]int{}
 	var latencies []time.Duration
@@ -211,6 +212,13 @@ func load(r *runner.Runner, langs map[string]runner.Lang, workers int, d time.Du
 				el := time.Since(start)
 
 				total.Add(1)
+				if resp.StatusCode == http.StatusServiceUnavailable {
+					busy.Add(1) // controlled overload rejection, not a failure
+					mu.Lock()
+					statuses["503 busy"]++
+					mu.Unlock()
+					continue
+				}
 				if res.Warm {
 					warm.Add(1)
 				}
@@ -255,7 +263,7 @@ func load(r *runner.Runner, langs map[string]runner.Lang, workers int, d time.Du
 		fmt.Printf("  %-16s %d\n", k, statuses[k])
 	}
 	fmt.Printf("latency ms: p50 %d, p95 %d, p99 %d\n", pct(latencies, 50), pct(latencies, 95), pct(latencies, 99))
-	fmt.Printf("internal errors: %d\nwrong status: %d\n", internal.Load(), wrong.Load())
+	fmt.Printf("internal errors: %d\nwrong status: %d\nrejected busy (503): %d\n", internal.Load(), wrong.Load(), busy.Load())
 	fmt.Printf("goroutines: %d before, %d after\n", before, after)
 	fmt.Printf("containers: %d before, %d after (pools full), %d after Close\n", containersBefore, containersAfter, containersClosed)
 
