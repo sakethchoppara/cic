@@ -22,6 +22,8 @@ curl -s localhost:8088/v1/execute -d '{"language": "python", "code": "print(sum(
  "timings":{"queue_ms":0,"compile_ms":0,"run_ms":52,"total_ms":131},"warm":true}
 ```
 
+Or open http://127.0.0.1:8088 for a minimal test page: pick a language, edit the code and stdin, and see the status, output, and timings.
+
 The API has no authentication. Keep it on localhost (see [SECURITY.md](SECURITY.md#known-gaps)).
 
 ## API

@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CIC</title>
+<style>
+  :root {
+    --bg: #fafaf9; --fg: #1c1917; --muted: #78716c; --line: #e7e5e4; --panel: #ffffff;
+    --ok: #15803d; --bad: #b91c1c; --warn: #b45309; --accent: #1d4ed8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1c1917; --fg: #f5f5f4; --muted: #a8a29e; --line: #44403c; --panel: #292524;
+      --ok: #4ade80; --bad: #f87171; --warn: #fbbf24; --accent: #93c5fd;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif; }
+  main { max-width: 900px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  p.sub { margin: 0 0 20px; color: var(--muted); }
+  .bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+  label { color: var(--muted); font-size: 13px; }
+  select, input, button, textarea {
+    font: inherit; color: var(--fg); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px;
+  }
+  input[type=number] { width: 90px; }
+  button { background: var(--accent); color: var(--bg); border-color: var(--accent); font-weight: 600; cursor: pointer; padding: 6px 16px; }
+  button:disabled { opacity: .6; cursor: wait; }
+  textarea { width: 100%; font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; resize: vertical; }
+  #code { min-height: 260px; }
+  #stdin { min-height: 60px; }
+  .hint { margin-left: auto; color: var(--muted); font-size: 13px; }
+  #result { margin-top: 20px; }
+  .meta { display: flex; gap: 16px; flex-wrap: wrap; align-items: baseline; margin-bottom: 8px; font-size: 13px; color: var(--muted); }
+  .status { font-weight: 700; font-size: 15px; }
+  .status.ok { color: var(--ok); }
+  .status.bad { color: var(--bad); }
+  .status.warn { color: var(--warn); }
+  h2 { font-size: 13px; color: var(--muted); font-weight: 600; margin: 12px 0 4px; }
+  pre {
+    margin: 0; padding: 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+    font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-word;
+    max-height: 360px; overflow: auto;
+  }
+  pre:empty::before { content: "(empty)"; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>CIC: Code-In-Container</h1>
+  <p class="sub">Runs your code in a fresh container: no network, read-only filesystem, non-root, memory, process, and time limits. The container is destroyed afterwards.</p>
+
+  <div class="bar">
+    <label for="lang">Language</label>
+    <select id="lang"></select>
+    <label for="timeout">Timeout ms</label>
+    <input id="timeout" type="number" min="1" max="15000" value="5000">
+    <label for="memory">Memory MB</label>
+    <input id="memory" type="number" min="32" max="512" placeholder="default">
+    <button id="run">Run</button>
+    <span class="hint">Ctrl+Enter</span>
+  </div>
+  <textarea id="code" spellcheck="false" aria-label="Code"></textarea>
+  <h2><label for="stdin">stdin</label></h2>
+  <textarea id="stdin" spellcheck="false"></textarea>
+
+  <section id="result" hidden aria-live="polite">
+    <div class="meta">
+      <span id="status" class="status"></span>
+      <span id="timings"></span>
+    </div>
+    <h2>stdout</h2>
+    <pre id="stdout"></pre>
+    <h2>stderr</h2>
+    <pre id="stderr"></pre>
+  </section>
+</main>
+<script>
+const samples = {
+  python: 'name = input() or "world"\nprint(f"hello, {name}")\nprint(sum(range(10)))',
+  node: 'const fs = require("fs");\nconst name = fs.readFileSync(0, "utf8").trim() || "world";\nconsole.log(`hello, ${name}`);',
+  c: '#include <stdio.h>\n\nint main(void) {\n    char name[64] = "world";\n    scanf("%63s", name);\n    printf("hello, %s\\n", name);\n    return 0;\n}',
+  rust: 'use std::io::Read;\n\nfn main() {\n    let mut s = String::new();\n    std::io::stdin().read_to_string(&mut s).unwrap();\n    let name = if s.trim().is_empty() { "world" } else { s.trim() };\n    println!("hello, {name}");\n}',
+  go: 'package main\n\nimport (\n\t"bufio"\n\t"fmt"\n\t"os"\n)\n\nfunc main() {\n\tname := "world"\n\tif s := bufio.NewScanner(os.Stdin); s.Scan() && s.Text() != "" {\n\t\tname = s.Text()\n\t}\n\tfmt.Printf("hello, %s\\n", name)\n}',
+};
+const $ = (id) => document.getElementById(id);
+const edited = {}; // per-language code the user typed, kept across switches
+
+async function init() {
+  const langs = await (await fetch("/v1/languages")).json();
+  for (const l of langs) $("lang").add(new Option(l, l));
+  $("lang").value = langs.includes("python") ? "python" : langs[0];
+  $("code").value = samples[$("lang").value] || "";
+}
+
+$("lang").addEventListener("focus", () => { edited[$("lang").value] = $("code").value; });
+$("lang").addEventListener("change", () => { $("code").value = edited[$("lang").value] ?? samples[$("lang").value] ?? ""; });
+
+async function run() {
+  $("run").disabled = true;
+  $("run").textContent = "Running…";
+  const limits = { timeout_ms: Number($("timeout").value) || 0 };
+  if ($("memory").value) limits.memory_mb = Number($("memory").value);
+  try {
+    const resp = await fetch("/v1/execute", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ language: $("lang").value, code: $("code").value, stdin: $("stdin").value, limits }),
+    });
+    const r = await resp.json();
+    show(r.error ? { status: `HTTP ${resp.status}`, stderr: r.error } : r);
+  } catch (e) {
+    show({ status: "request failed", stderr: String(e) });
+  } finally {
+    $("run").disabled = false;
+    $("run").textContent = "Run";
+  }
+}
+
+function show(r) {
+  $("result").hidden = false;
+  const s = $("status");
+  s.textContent = r.status + (r.phase ? ` (${r.phase})` : "") + (r.exit_code ? ` · exit ${r.exit_code}` : "");
+  s.className = "status " + (r.status === "ok" ? "ok" : ["timeout", "memory_exceeded"].includes(r.status) ? "warn" : "bad");
+  const t = r.timings;
+  $("timings").textContent = t
+    ? `total ${t.total_ms} ms · queue ${t.queue_ms} · compile ${t.compile_ms} · run ${t.run_ms} · ${r.warm ? "warm" : "cold"} container`
+    : "";
+  // textContent, never innerHTML: output is untrusted.
+  $("stdout").textContent = (r.stdout || "") + (r.stdout_truncated ? "\n[truncated]" : "");
+  $("stderr").textContent = (r.stderr || "") + (r.stderr_truncated ? "\n[truncated]" : "");
+}
+
+$("run").addEventListener("click", run);
+document.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter" && !$("run").disabled) run();
+});
+$("code").addEventListener("keydown", (e) => {
+  if (e.key !== "Tab") return;
+  e.preventDefault();
+  const el = e.target, i = el.selectionStart;
+  el.setRangeText("    ", i, el.selectionEnd, "end");
+});
+init();
+</script>
+</body>
+</html>

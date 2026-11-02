@@ -1,6 +1,7 @@
 package api
 
 import (
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"log"
@@ -24,6 +25,9 @@ const (
 	minMemoryMB      = 32
 	maxMemoryMB      = 512
 )
+
+//go:embed index.html
+var indexHTML []byte
 
 type ExecuteRequest struct {
 	Language string `json:"language"`
@@ -57,6 +61,12 @@ type ExecuteResponse struct {
 func Routes(pools map[string]*pool.Pool) http.Handler {
 	names := slices.Sorted(maps.Keys(pools))
 	mux := http.NewServeMux()
+	// Exact root only, so a wrong method on an API path is still a 405, not a 404.
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Write(indexHTML)
+	})
 	mux.HandleFunc("POST /v1/execute", func(w http.ResponseWriter, r *http.Request) { execute(w, r, pools) })
 	mux.HandleFunc("GET /v1/languages", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, http.StatusOK, names) })
 	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, r *http.Request) {
