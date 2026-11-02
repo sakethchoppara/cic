@@ -15,3 +15,10 @@
 - A bug that let request data reach container options would be a host compromise. Any change to `runner.start` deserves extra scrutiny.
 - The runner can't ship in Docker Compose without a proxy. Mounting the socket into the runner's own container would contradict this decision.
 - **Next step:** a socket proxy allowing only create, start, exec (create, start, inspect), update, kill, list, and remove, and rejecting `Privileged`, binds, and host namespaces in create bodies. Rootless Docker is the stronger option if the host allows it.
+
+**Update (Week 8): socket proxy built.** `cic-dockerproxy` (`internal/dockerproxy`) now sits between the runner and the daemon in the Compose setup. Decisions made while building it:
+- **Allowlist, not blocklist.** A create body may only contain the options the runner sets. Any other key with a non-zero value is refused, so new Docker features are denied by default. "Zero" is defined carefully: the client sends unused structs like `"RestartPolicy": {"Name": ""}`, but in `"Volumes": {"/data": {}}` the empty object is the point, so a nested empty object or array counts as non-zero. A unit test caught the first version letting that volume through.
+- **Label check by inspecting the container**, cached per container ID, so start, kill, update, exec, and remove only touch `cic` containers. Measured latency is unchanged within noise.
+- **Exec start and inspect aren't label-checked:** exec IDs are 64 hex characters and only come from checked exec creates.
+- **Reject `..` and escaped paths outright,** rather than trying to predict how the daemon normalizes them.
+- **Written in Go rather than using an off-the-shelf proxy:** HAProxy-based proxies filter by endpoint, but they can't inspect a create body for `Privileged` or binds, which is the attack that matters.

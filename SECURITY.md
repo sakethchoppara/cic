@@ -62,14 +62,26 @@ The checks that print `SAFE` were confirmed to print `UNSAFE` in a deliberately 
 
 ## Docker socket access
 
-**v1 decision:** the runner is a host binary that uses the local Docker socket directly, on a single-user development machine. It is not run in a container, and the socket is never mounted into any container it starts (`host_paths.py` checks this).
+Anything that can talk to the Docker daemon can start a privileged container that mounts `/`, which is root on the host. CIC supports two setups:
 
-Why: it's the simplest setup that keeps the socket out of reach of user code. The runner only makes create, start, exec, update, kill, inspect, list, and remove calls, with arguments built from the trusted config, never from the request.
+**Development (`go run ./cmd/cic`):** the runner uses the local Docker socket directly. The socket is never mounted into any container it starts (`host_paths.py` checks this). The runner builds every create request from the trusted config, never from request data. Even so, a bug in that code would be a host compromise. Run it as a dedicated user in the `docker` group, not your own account.
 
-Operating it more safely, in order of effort:
-1. Run it as a dedicated user in the `docker` group, not your own account.
-2. Put a socket proxy in front of the daemon that allows only the calls above, and denies `Privileged`, bind mounts, and host namespaces in create requests. This is required before the runner ships in Docker Compose.
-3. Use rootless Docker, so "root on the daemon" is an unprivileged user on the host.
+**Compose (`docker compose up`), and anywhere else the runner shouldn't be trusted with root:** the runner reaches the daemon only through `cic-dockerproxy` (`internal/dockerproxy`). The proxy runs in its own container with no network, a read-only filesystem, and no capabilities, and it is the only thing that gets the host socket. It forwards only what the runner needs:
+
+| Call | Allowed when |
+|---|---|
+| ping, version, image inspect | always (read-only) |
+| container create | every sandbox setting is present: an image from `languages.yaml`, a non-root user, the `cic` label, network `none`, read-only root, `CapDrop: ALL`, exactly `no-new-privileges`, at most 1 CPU, memory and pids limits within the config's largest budgets, no swap, tmpfs only at `/tmp` and `/work` with a size. **Any other option with a non-zero value is refused**, so privileged mode, bind mounts, volumes, devices, host namespaces, sysctls, runtimes, port bindings, and options added to Docker in the future are all denied. |
+| start, kill, update, exec, remove | the container carries the `cic` label. Update may only change memory, swap (equal to memory), and pids, within the same bounds. Exec must name a non-root user and may not be privileged. |
+| exec start, exec inspect | always: exec IDs are unguessable and only come from checked exec creates |
+| container list | filtered to `cic` labels |
+| anything else (pull, build, archive copy, attach, commit, volumes, networks, swarm, plugins) | never |
+
+Paths containing `..` or escaped characters are refused, so a path that passes the checks can't mean something else to the daemon. Every refusal is logged. Unit tests cover 39 create-time attacks and 23 other calls, and an integration test runs the real runner through the proxy against the real daemon, then checks that a privileged create with `/` mounted, an unfiltered list, an image pull, and removing or exec'ing into a non-`cic` container are all refused. The full test suite and a load test pass through the proxy binary with no denials, and latency is unchanged within noise.
+
+With the proxy, a compromised runner can still start sandboxed containers (up to the `-max-runs` budget it is honest about, or more if it isn't), stop or remove CIC's own containers, and run code in them as a non-root user. It can't escape to the host through Docker.
+
+Rootless Docker would add another layer: even the proxy's "root on the daemon" would be an unprivileged host user.
 
 ## Known gaps
 
@@ -77,7 +89,7 @@ These are real, unmitigated in v1, and roughly in order of severity.
 
 1. **Shared kernel.** Containers share the host kernel. A kernel exploit reachable through the syscalls the default seccomp profile allows escapes everything above. gVisor (`runsc`) or Firecracker microVMs would close this; gVisor is a drop-in Docker runtime.
 2. **No authentication or per-client rate limiting.** Anyone who can reach the port can run code. The `-max-runs` cap bounds how many containers run at once, but not who uses them: one client can hold every slot and starve everyone else (they get 503). Size the cap to memory too: each run may use up to 512 MB, or 1 GB while compiling, so 16 slots can still reach 16 GB in the worst case. Keep the default `127.0.0.1` bind.
-3. **The Docker socket is root.** See above. A bug in the runner that lets request data reach container create options would be a host compromise.
+3. **The Docker socket is still root, one hop away.** With the proxy, it's held by a small, networkless process instead of the runner. A bug in the proxy's checks, or a Docker API change that adds a dangerous effect to a call the proxy allows, would undo that. Without the proxy (the development setup), a bug in the runner that lets request data reach container options is a host compromise. Nothing limits how many containers a compromised runner starts through the proxy.
 4. **No user namespace remapping.** UID 65534 in the container is UID 65534 on the host. Combined with gap 1, an escape lands as host `nobody` rather than an unmapped UID. Docker's `userns-remap` would add that layer.
 5. **Information disclosure.** `/proc` and `/sys` reveal the host kernel version, CPU model, memory size, and uptime. Timing and cache side channels between concurrent runs are not addressed.
 6. **No disk I/O limits.** There are no blkio limits, but no persistent writable disk is reachable either; tmpfs is in memory and counted against the memory limit.
